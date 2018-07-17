@@ -32,7 +32,7 @@ module AuthTrail
 
     unless exclude
       if AuthTrail.track_method
-        AuthTrail.track_method.call(info)
+        AuthTrail.track_method.call(info, request)
       else
         login_activity = LoginActivity.create!(info)
         AuthTrail::GeocodeJob.perform_later(login_activity) if AuthTrail.geocode
