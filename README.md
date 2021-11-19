@@ -2,7 +2,11 @@
 
 Track Devise login activity
 
+**AuthTrail 0.4.0 was recently released** - see [how to upgrade](#upgrading)
+
 :tangerine: Battle-tested at [Instacart](https://www.instacart.com/opensource)
+
+[![Build Status](https://github.com/ankane/authtrail/workflows/build/badge.svg?branch=master)](https://github.com/ankane/authtrail/actions)
 
 ## Installation
 
@@ -12,12 +16,21 @@ Add this line to your application’s Gemfile:
 gem 'authtrail'
 ```
 
-And run:
+To encrypt email and IP addresses, install [Lockbox](https://github.com/ankane/lockbox) and [Blind Index](https://github.com/ankane/blind_index) and run:
+
+```sh
+rails generate authtrail:install --lockbox
+rails db:migrate
+```
+
+If you prefer not to encrypt data, run:
 
 ```sh
 rails generate authtrail:install
-rake db:migrate
+rails db:migrate
 ```
+
+To enable geocoding, see the [Geocoding section](#geocoding).
 
 ## How It Works
 
@@ -32,7 +45,7 @@ A `LoginActivity` record is created every time a user tries to login. You can th
 - `context` - controller and action
 - `ip` - IP address
 - `user_agent` and `referrer` - from browser
-- `city`, `region`, and `country` - from IP
+- `city`, `region`, `country`, `latitude`, and `longitude` - from IP
 - `created_at` - time of event
 
 ## Features
@@ -40,70 +53,164 @@ A `LoginActivity` record is created every time a user tries to login. You can th
 Exclude certain attempts from tracking - useful if you run acceptance tests
 
 ```ruby
-AuthTrail.exclude_method = proc do |info|
-  info[:identity] == "capybara@example.org"
+AuthTrail.exclude_method = lambda do |data|
+  data[:identity] == "capybara@example.org"
 end
 ```
 
-Write data somewhere other than the `login_activities` table.
+Add or modify data - also add new fields to the `login_activities` table if needed
 
 ```ruby
-AuthTrail.track_method = proc do |info|
+AuthTrail.transform_method = lambda do |data, request|
+  data[:request_id] = request.request_id
+end
+```
+
+Store the user on failed attempts
+
+```ruby
+AuthTrail.transform_method = lambda do |data, request|
+  data[:user] ||= User.find_by(email: data[:identity])
+end
+```
+
+Write data somewhere other than the `login_activities` table
+
+```ruby
+AuthTrail.track_method = lambda do |data|
   # code
 end
 ```
 
+Use a custom identity method
+
+```ruby
+AuthTrail.identity_method = lambda do |request, opts, user|
+  if user
+    user.email
+  else
+    request.params.dig(opts[:scope], :email)
+  end
+end
+```
+
+Associate login activity with your user model
+
+```ruby
+class User < ApplicationRecord
+  has_many :login_activities, as: :user # use :user no matter what your model name
+end
+```
+
+The `LoginActivity` model uses a [polymorphic association](https://guides.rubyonrails.org/association_basics.html#polymorphic-associations) so it can be associated with different user models.
+
 ## Geocoding
 
-IP geocoding is performed in a background job so it doesn’t slow down web requests. You can disable it entirely with:
+AuthTrail uses [Geocoder](https://github.com/alexreisner/geocoder) for geocoding. We recommend configuring [local geocoding](#local-geocoding) or [load balancer geocoding](#load-balancer-geocoding) so IP addresses are not sent to a 3rd party service. If you do use a 3rd party service and adhere to GDPR, be sure to add it to your subprocessor list.
+
+To enable geocoding, add this line to your application’s Gemfile:
 
 ```ruby
-AuthTrail.geocode = false
+gem 'geocoder'
 ```
 
-Set job queue for geocoding
+And update `config/initializers/authtrail.rb`:
 
 ```ruby
-AuthTrail::GeocodeJob.queue_as :low
+AuthTrail.geocode = true
 ```
 
-### Geocoding Performance
+Geocoding is performed in a background job so it doesn’t slow down web requests. Set the job queue with:
 
-To avoid calls to a remote API, download the [GeoLite2 City database](https://dev.maxmind.com/geoip/geoip2/geolite2/) and configure Geocoder to use it.
+```ruby
+AuthTrail.job_queue = :low_priority
+```
 
-Add this line to your application’s Gemfile:
+### Local Geocoding
+
+For privacy and performance, we recommend geocoding locally. Add this line to your application’s Gemfile:
 
 ```ruby
 gem 'maxminddb'
 ```
 
-And create an initializer at `config/initializers/geocoder.rb` with:
+For city-level geocoding, download the [GeoLite2 City database](https://dev.maxmind.com/geoip/geoip2/geolite2/) and create `config/initializers/geocoder.rb` with:
 
 ```ruby
 Geocoder.configure(
   ip_lookup: :geoip2,
   geoip2: {
-    file: Rails.root.join("lib", "GeoLite2-City.mmdb")
+    file: "path/to/GeoLite2-City.mmdb"
   }
 )
 ```
 
-## Privacy
+For country-level geocoding, install the `geoip-database` package. It’s preinstalled on Heroku. For Ubuntu, use:
 
-Protect the privacy of your users by encrypting fields that contain personal information, such as `identity` and `ip`. [attr_encrypted](https://github.com/attr-encrypted/attr_encrypted) is a great library for this.
+```sh
+sudo apt-get install geoip-database
+```
+
+And create `config/initializers/geocoder.rb` with:
 
 ```ruby
-class LoginActivity < ApplicationRecord
-  attr_encrypted :identity, ...
-  attr_encrypted :ip, ...
+Geocoder.configure(
+  ip_lookup: :maxmind_local,
+  maxmind_local: {
+    file: "/usr/share/GeoIP/GeoIP.dat",
+    package: :country
+  }
+)
+```
+
+### Load Balancer Geocoding
+
+Some load balancers can add geocoding information to request headers.
+
+- [nginx](https://nginx.org/en/docs/http/ngx_http_geoip_module.html)
+- [Google Cloud](https://cloud.google.com/load-balancing/docs/custom-headers)
+- [Cloudflare](https://support.cloudflare.com/hc/en-us/articles/200168236-Configuring-Cloudflare-IP-Geolocation)
+
+```ruby
+AuthTrail.geocode = false
+
+AuthTrail.transform_method = lambda do |data, request|
+  data[:country] = request.headers["<country-header>"]
+  data[:region] = request.headers["<region-header>"]
+  data[:city] = request.headers["<city-header>"]
 end
 ```
+
+Check out [this example](https://github.com/ankane/authtrail/issues/40)
 
 ## Other Notes
 
 We recommend using this in addition to Devise’s `Lockable` module and [Rack::Attack](https://github.com/kickstarter/rack-attack).
 
-Works with Rails 5+
+Check out [Hardening Devise](https://ankane.org/hardening-devise) and [Secure Rails](https://github.com/ankane/secure_rails) for more best practices.
+
+## Upgrading
+
+### 0.4.0
+
+There are two notable changes to geocoding:
+
+1. Geocoding is now disabled by default (this was already the case for new installations with 0.3.0+). Check out the instructions for [how to enable it](#geocoding) (you may need to create `config/initializers/authtrail.rb`).
+
+2. The `geocoder` gem is now an optional dependency. To use geocoding, add it to your Gemfile:
+
+  ```ruby
+  gem 'geocoder'
+  ```
+
+### 0.2.0
+
+To store latitude and longitude, create a migration with:
+
+```ruby
+add_column :login_activities, :latitude, :float
+add_column :login_activities, :longitude, :float
+```
 
 ## History
 
@@ -117,3 +224,12 @@ Everyone is encouraged to help improve this project. Here are a few ways you can
 - Fix bugs and [submit pull requests](https://github.com/ankane/authtrail/pulls)
 - Write, clarify, or fix documentation
 - Suggest or add new features
+
+To get started with development and testing:
+
+```sh
+git clone https://github.com/ankane/authtrail.git
+cd authtrail
+bundle install
+bundle exec rake test
+```
